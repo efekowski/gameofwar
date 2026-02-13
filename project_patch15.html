@@ -1,0 +1,1691 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+  <title>project_patch15</title>
+  <style>
+    html,body{margin:0;padding:0;width:100%;height:100%;background:#070b16;overflow:hidden;touch-action:none;}
+    canvas{display:block;width:100vw;height:100vh;touch-action:none;}
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  // =========================================================
+  // PATCH #15 — Core progression schemas + map/city stability + persistence safety
+  // =========================================================
+  // - Draw real 50×50 iso diamond map (no external assets)
+  // - Pan/zoom (drag, pinch; wheel on desktop)
+  // - Tile type distribution + legend
+  // - Tap select + highlight + info card
+  // - Keeps the stable boot/resize/storage foundation from Patch #09
+  //
+  // NOTE: Adds progression/resource/building/tech/unit schemas and keeps patch14 stability features.
+  // =========================================================
+
+  // ---------- Safe storage ----------
+  const StorageSafe = (() => {
+    const KEY = 'project_save_v1';
+    const KEY_BACKUP = 'project_save_v1_backup';
+    let mem = null;
+
+    function canUseLocalStorage() {
+      try {
+        const k = '__t' + Math.random();
+        localStorage.setItem(k, '1');
+        localStorage.removeItem(k);
+        return true;
+      } catch (e) { return false; }
+    }
+    const hasLS = canUseLocalStorage();
+
+    function load() {
+      try {
+        if (hasLS) {
+          const s = localStorage.getItem(KEY);
+          if (s) return JSON.parse(s);
+          const b = localStorage.getItem(KEY_BACKUP);
+          return b ? JSON.parse(b) : null;
+        }
+      } catch (e) {}
+      return mem ? JSON.parse(JSON.stringify(mem)) : null;
+    }
+
+    function save(obj) {
+      try {
+        const s = JSON.stringify(obj);
+        if (hasLS) {
+          const prev = localStorage.getItem(KEY);
+          if (prev) localStorage.setItem(KEY_BACKUP, prev);
+          localStorage.setItem(KEY, s);
+        }
+        else mem = JSON.parse(s);
+        return true;
+      } catch (e) { return false; }
+    }
+
+    function clear() {
+      try {
+        if (hasLS) {
+          localStorage.removeItem(KEY);
+          localStorage.removeItem(KEY_BACKUP);
+        }
+      } catch (e) {}
+      mem = null;
+    }
+
+    return { KEY, KEY_BACKUP, hasLS: () => hasLS, load, save, clear };
+  })();
+
+  // ---------- Bridges (stubs now, hooks later) ----------
+  const AdBridge = {
+    isAvailable: () => false,
+    showInterstitial: async () => false,
+    showRewarded: async () => ({ ok:false, rewarded:false })
+  };
+
+  const ReviewBridge = {
+    requestReview: async () => ({ ok:false, fallback:'store' }),
+    openStoreListing: () => false
+  };
+
+  const AudioBridge = {
+    playSfx: (_name) => {},
+    setMusicEnabled: (_b) => {},
+    setSfxEnabled: (_b) => {}
+  };
+
+  const HapticsBridge = {
+    vibrate: (ms=20) => { try { if (navigator.vibrate) navigator.vibrate(ms); } catch(e){} }
+  };
+
+  // ---------- i18n ----------
+  const I18N = (() => {
+    const STR = {
+      tr: {
+        map: 'Harita',
+        city: 'Şehir',
+        settings: 'Ayarlar',
+        language: 'Dil',
+        sound: 'Ses',
+        music: 'Müzik',
+        haptics: 'Titreşim',
+        reset: 'Sıfırla',
+        reset_confirm: 'Tüm veriler silinsin mi?',
+        yes: 'Evet',
+        no: 'Hayır',
+        debug_on: 'Debug: ON',
+        debug_off: 'Debug: OFF',
+        diagnostics: 'Tanı',
+        storage_ok: 'Storage: OK',
+        storage_mem: 'Storage: MEM',
+        // map
+        legend: 'Harita İşaretleri',
+        tile_empty: 'Boş Arazi',
+        tile_farm: 'Tarla (Food)',
+        tile_forest: 'Orman (Wood)',
+        tile_mine: 'Maden (Iron)',
+        tile_barbar: 'Barbar Kampı',
+        tile_kingdom: 'Krallık Kalesi',
+        selected: 'Seçildi',
+        coord: 'Koordinat',
+        hint_tap: 'Bir tile seçmek için dokun',
+        place: 'Yerleştir',
+        region: 'Bölge',
+        kingdom: 'Krallık',
+        req_power: 'Gerekli Güç',
+        reward: 'Ödül',
+      },
+      en: {
+        map: 'Map',
+        city: 'City',
+        settings: 'Settings',
+        language: 'Language',
+        sound: 'Sound',
+        music: 'Music',
+        haptics: 'Haptics',
+        reset: 'Reset',
+        reset_confirm: 'Erase all data?',
+        yes: 'Yes',
+        no: 'No',
+        debug_on: 'Debug: ON',
+        debug_off: 'Debug: OFF',
+        diagnostics: 'Diagnostics',
+        storage_ok: 'Storage: OK',
+        storage_mem: 'Storage: MEM',
+        // map
+        legend: 'Legend',
+        tile_empty: 'Empty',
+        tile_farm: 'Farm (Food)',
+        tile_forest: 'Forest (Wood)',
+        tile_mine: 'Mine (Iron)',
+        tile_barbar: 'Barbarian Camp',
+        tile_kingdom: 'Kingdom Fortress',
+        selected: 'Selected',
+        coord: 'Coord',
+        hint_tap: 'Tap to select a tile',
+        place: 'Place',
+        region: 'Region',
+        kingdom: 'Kingdom',
+        req_power: 'Required Power',
+        reward: 'Reward',
+      }
+    };
+
+    let lang = 'en';
+    function detectDefault() {
+      const n = (navigator.language || 'en').toLowerCase();
+      if (n.startsWith('tr')) return 'tr';
+      return 'en';
+    }
+    function set(l) { lang = (l === 'tr' || l === 'en') ? l : 'en'; }
+    function get() { return lang; }
+    function t(k) {
+      const pack = STR[lang] || STR.en;
+      return (pack && pack[k]) ? pack[k] : (STR.en[k] || k);
+    }
+    return { detectDefault, set, get, t };
+  })();
+
+
+  // ---------- Core game schemas ----------
+  const GameData = (() => {
+    const regionNames = {
+      tr: ['Roma','Kartaca','Mısır','Yunan','Pers','Galya','İberya','Britanya','İskit','Mezopotamya'],
+      en: ['Rome','Carthage','Egypt','Greece','Persia','Gaul','Iberia','Britannia','Scythia','Mesopotamia']
+    };
+
+    const regions = [];
+    for (let r=1;r<=10;r++) {
+      const kingdoms = [];
+      for (let k=1;k<=20;k++) {
+        kingdoms.push({
+          id: k,
+          difficulty: k,
+          requiredPower: 500 + k*250,
+          reward: { food: 200 + k*50, wood: 200 + k*50, iron: 120 + k*35, imperialGold: k%5===0 ? 10 : 0 },
+          unlocksNext: k < 20 ? { kingdomId: k+1 } : { regionId: r+1 }
+        });
+      }
+      regions.push({ id:r, code:'region_'+r, kingdoms });
+    }
+
+    const resources = ['food','wood','iron'];
+
+    const buildingTiers = {
+      tier1:['town_hall','farm','lumber_mill','iron_mine','barracks','academy','warehouse'],
+      tier2:['hospital','city_wall','watchtower','stable','archery_range','market','expedition_center','scout_center'],
+      tier3:['siege_workshop','shield_tower','trap_workshop','library','laboratory','trade_office','hero_hall','blacksmith'],
+      tier4:['arena','monument','magic_tower','event_center','treasury','senate','archive','message_hall','alliance_center']
+    };
+
+    const cityRules = {
+      baseCapacity: 25,
+      capacityPerTownHallLevel: 5,
+      maxBuildingLevelByTownHall: true
+    };
+
+    const techTree = {
+      economy:['agri_1','agri_2','agri_3','agri_4','wood_1','wood_2','wood_3','wood_4','mine_1','mine_2','mine_3','mine_4'],
+      military:['inf_1','inf_2','inf_3','inf_4','arc_1','arc_2','arc_3','arc_4','cav_1','cav_2','cav_3','cav_4'],
+      development:['build_1','build_2','build_3','build_4','log_1','log_2','log_3','log_4','gov_1','gov_2','gov_3','gov_4'],
+      durationRuleMinutesPerLevel: 10
+    };
+
+    const units = {
+      infantry:{atk:10,def:12,hp:40,speed:'medium',carry:20,advantage:'archer'},
+      archer:{atk:14,def:6,hp:25,speed:'medium',carry:15,advantage:'cavalry'},
+      cavalry:{atk:13,def:9,hp:30,speed:'high',carry:25,advantage:'infantry'},
+      siege:{atk:20,def:5,hp:20,speed:'very_slow',carry:5,advantage:'city_fort'}
+    };
+
+    function regionName(regionId, lang){
+      const i = Math.max(1, Math.min(10, regionId|0)) - 1;
+      const l = (lang==='tr'||lang==='en') ? lang : 'en';
+      return regionNames[l][i];
+    }
+
+    return { regions, resources, buildingTiers, cityRules, techTree, units, regionName };
+  })();
+
+  // ---------- Canvas / rendering ----------
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+  if (!ctx) { alert('Canvas 2D context not available.'); throw new Error('No 2D context'); }
+
+  let vw = 1, vh = 1, dpr = 1;
+
+  function resize() {
+    dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    vw = Math.max(1, (window.innerWidth|0) || 1);
+    vh = Math.max(1, (window.innerHeight|0) || 1);
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    canvas.width = Math.max(1, (vw * dpr) | 0);
+    canvas.height = Math.max(1, (vh * dpr) | 0);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+
+  // ---------- App state (persisted) ----------
+  const defaultState = () => ({
+    v: 1,
+    lang: I18N.detectDefault(),
+    settings: { sound:true, music:true, haptics:true },
+    screen: 'map', // 'map' | 'city'
+    ui: { settingsOpen:false, confirmReset:false, debug:false },
+    map: {
+      seed: 1337,
+      camX: 0,
+      camY: 0,
+      zoom: 1.0,
+      selX: 25,
+      selY: 25
+    },
+    city: {
+      camX: 0,
+      camY: -40,
+      ghostActive: false,
+      ghostX: 0,
+      ghostY: 0,
+      buildings: []
+    },
+    saveMeta: {
+      lastSaveTs: Date.now()
+    },
+    world: {
+      currentRegionId: 1,
+      unlockedRegionIds: [1],
+      defeatedByRegion: { '1': 0 },
+      selectedKingdomId: 1
+    },
+    resources: {
+      food: 1000,
+      wood: 1000,
+      iron: 600
+    }
+  });
+
+  let state = defaultState();
+
+  function loadState() {
+    const s = StorageSafe.load();
+    if (!s || typeof s !== 'object') return;
+    try {
+      if (s.lang === 'tr' || s.lang === 'en') state.lang = s.lang;
+      if (s.settings) {
+        state.settings.sound = !!s.settings.sound;
+        state.settings.music = !!s.settings.music;
+        state.settings.haptics = !!s.settings.haptics;
+      }
+      if (s.screen === 'map' || s.screen === 'city') state.screen = s.screen;
+      if (s.ui) {
+        state.ui.settingsOpen = !!s.ui.settingsOpen;
+        state.ui.debug = !!s.ui.debug;
+      }
+      if (s.map) {
+        state.map.seed = (s.map.seed|0) || state.map.seed;
+        state.map.camX = Number.isFinite(s.map.camX) ? s.map.camX : state.map.camX;
+        state.map.camY = Number.isFinite(s.map.camY) ? s.map.camY : state.map.camY;
+        state.map.zoom = Number.isFinite(s.map.zoom) ? clamp(s.map.zoom, 0.5, 2.5) : state.map.zoom;
+        state.map.selX = (s.map.selX|0) || state.map.selX;
+        state.map.selY = (s.map.selY|0) || state.map.selY;
+      }
+      if (s.city) {
+        state.city.camX = Number.isFinite(s.city.camX) ? s.city.camX : state.city.camX;
+        state.city.camY = Number.isFinite(s.city.camY) ? s.city.camY : state.city.camY;
+        if (Array.isArray(s.city.buildings)) {
+          state.city.buildings = s.city.buildings.filter(b => b && Number.isFinite(b.x) && Number.isFinite(b.y)).map(b => ({ x:b.x|0, y:b.y|0, w:2, h:2 }));
+        }
+      }
+      if (s.saveMeta && Number.isFinite(s.saveMeta.lastSaveTs)) {
+        const now = Date.now();
+        const prev = s.saveMeta.lastSaveTs;
+        if (prev <= now) {
+          const delta = Math.min(24*60*60*1000, now - prev);
+          state.saveMeta.lastSaveTs = now - delta;
+        } else {
+          state.saveMeta.lastSaveTs = now;
+        }
+      }
+      if (s.world) {
+        state.world.currentRegionId = Number.isFinite(s.world.currentRegionId) ? clamp(s.world.currentRegionId|0,1,10) : 1;
+        state.world.selectedKingdomId = Number.isFinite(s.world.selectedKingdomId) ? clamp(s.world.selectedKingdomId|0,1,20) : 1;
+        if (Array.isArray(s.world.unlockedRegionIds) && s.world.unlockedRegionIds.length) {
+          state.world.unlockedRegionIds = s.world.unlockedRegionIds.filter(v => Number.isFinite(v)).map(v => clamp(v|0,1,10));
+        }
+        if (s.world.defeatedByRegion && typeof s.world.defeatedByRegion === 'object') {
+          state.world.defeatedByRegion = s.world.defeatedByRegion;
+        }
+      }
+      if (s.resources && typeof s.resources === 'object') {
+        state.resources.food = Number.isFinite(s.resources.food) ? Math.max(0, s.resources.food|0) : state.resources.food;
+        state.resources.wood = Number.isFinite(s.resources.wood) ? Math.max(0, s.resources.wood|0) : state.resources.wood;
+        state.resources.iron = Number.isFinite(s.resources.iron) ? Math.max(0, s.resources.iron|0) : state.resources.iron;
+      }
+      state.city.ghostActive = false;
+      state.ui.confirmReset = false;
+    } catch(e) {}
+  }
+
+  let saveDirty = false;
+  function requestSave() { saveDirty = true; }
+  function flushSave() {
+    if (!saveDirty) return;
+    saveDirty = false;
+    StorageSafe.save({
+      v: state.v,
+      lang: state.lang,
+      settings: state.settings,
+      screen: state.screen,
+      ui: { settingsOpen: state.ui.settingsOpen, debug: state.ui.debug },
+      map: {
+        seed: state.map.seed|0,
+        camX: state.map.camX,
+        camY: state.map.camY,
+        zoom: state.map.zoom,
+        selX: state.map.selX|0,
+        selY: state.map.selY|0
+      },
+      city: {
+        camX: state.city.camX,
+        camY: state.city.camY,
+        buildings: state.city.buildings.map(b => ({ x:b.x|0, y:b.y|0, w:2, h:2 }))
+      },
+      saveMeta: {
+        lastSaveTs: Date.now()
+      },
+      world: {
+        currentRegionId: state.world.currentRegionId|0,
+        unlockedRegionIds: state.world.unlockedRegionIds.slice(),
+        defeatedByRegion: state.world.defeatedByRegion,
+        selectedKingdomId: state.world.selectedKingdomId|0
+      },
+      resources: {
+        food: state.resources.food|0,
+        wood: state.resources.wood|0,
+        iron: state.resources.iron|0
+      }
+    });
+    diag.lastSaveAt = performance.now();
+  }
+
+  function hardReset() {
+    StorageSafe.clear();
+    state = defaultState();
+    I18N.set(state.lang);
+    toast(I18N.t('reset'), 1.0);
+    requestSave();
+  }
+
+  // ---------- Diagnostics ----------
+  const diag = {
+    lastErr: '',
+    lastErrAt: 0,
+    lastSaveAt: 0,
+    fps: 0,
+    frameMs: 0
+  };
+
+  window.addEventListener('error', (e) => {
+    try {
+      diag.lastErr = String(e && e.message ? e.message : 'error');
+      diag.lastErrAt = performance.now();
+    } catch(_) {}
+  }, { passive:true });
+
+  window.addEventListener('unhandledrejection', (e) => {
+    try {
+      const r = e && e.reason;
+      diag.lastErr = 'promise: ' + (r && r.message ? r.message : String(r));
+      diag.lastErrAt = performance.now();
+    } catch(_) {}
+  }, { passive:true });
+
+  // ---------- Helpers ----------
+  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+
+  function roundRect(x,y,w,h,r) {
+    const rr = Math.min(r, w*0.5, h*0.5);
+    ctx.beginPath();
+    ctx.moveTo(x+rr, y);
+    ctx.arcTo(x+w, y, x+w, y+h, rr);
+    ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr);
+    ctx.arcTo(x, y, x+w, y, rr);
+    ctx.closePath();
+  }
+
+  // ---------- Toast ----------
+  const toastState = { text:'', until:0 };
+  function toast(text, seconds=1.2) {
+    toastState.text = String(text || '');
+    toastState.until = performance.now() + seconds*1000;
+  }
+
+  // ---------- Button system ----------
+  const Buttons = (() => {
+    let list = [];
+    let pressedId = null;
+
+    function clear() { list.length = 0; }
+    function add(b) { list.push(b); }
+    function hit(x,y) {
+      for (let i=list.length-1;i>=0;i--) {
+        const b = list[i];
+        if (x>=b.x && x<=b.x+b.w && y>=b.y && y<=b.y+b.h) return b;
+      }
+      return null;
+    }
+    function onDown(x,y) { const b = hit(x,y); pressedId = b ? b.id : null; return !!b; }
+    function onUp(x,y) {
+      const b = hit(x,y);
+      const fired = b && b.id === pressedId;
+      pressedId = null;
+      if (fired && b.onClick) b.onClick();
+      return fired;
+    }
+    function cancel(){ pressedId = null; }
+    function draw() { for (let i=0;i<list.length;i++) drawButton(list[i], list[i].id === pressedId); }
+    return { clear, add, onDown, onUp, cancel, draw, _list:() => list };
+  })();
+
+  function drawButton(b, pressed) {
+    const elev = pressed ? 1 : 4;
+    ctx.save();
+
+    // shadow
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = '#000';
+    roundRect(b.x, b.y+elev, b.w, b.h, b.r);
+    ctx.fill();
+
+    // body
+    ctx.globalAlpha = 1;
+    const grad = ctx.createLinearGradient(0, b.y, 0, b.y+b.h);
+    if (b.kind === 'primary') {
+      grad.addColorStop(0, pressed ? '#2a7cff' : '#3b86ff');
+      grad.addColorStop(1, pressed ? '#1e4fcc' : '#1f58d8');
+    } else {
+      grad.addColorStop(0, pressed ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.12)');
+      grad.addColorStop(1, pressed ? 'rgba(0,0,0,0.20)' : 'rgba(0,0,0,0.26)');
+    }
+    ctx.fillStyle = grad;
+    roundRect(b.x, b.y, b.w, b.h, b.r);
+    ctx.fill();
+
+    // stroke
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // label
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = b.font;
+    ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2 + (pressed?1:0));
+
+    ctx.restore();
+  }
+
+  // ---------- Map model ----------
+  const Map = (() => {
+    const W = 50, H = 50;
+
+    // tile types
+    const T_EMPTY = 0;
+    const T_FARM = 1;
+    const T_FOREST = 2;
+    const T_MINE = 3;
+    const T_BARB = 4;
+    const T_KING = 5;
+
+    // distribution targets (MVP)
+    // (kingdoms are sparse but guaranteed 20 in region)
+    const R = {
+      farm: 0.10,
+      forest: 0.10,
+      mine: 0.08,
+      barb: 0.03,
+      king: 20 // absolute count (20 fortresses)
+    };
+
+    let tiles = null; // Uint8Array W*H
+    let kingdomIndex = null; // Int16Array W*H -> kingdom number (1..20) else 0
+
+    function idx(x,y){ return y*W + x; }
+
+    function mulberry32(a) {
+      return function() {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function regen(seed){
+      const rand = mulberry32((seed|0) >>> 0);
+
+      tiles = new Uint8Array(W*H);
+      kingdomIndex = new Int16Array(W*H);
+
+      // start all empty
+      for (let i=0;i<tiles.length;i++) tiles[i] = T_EMPTY;
+
+      // place 20 kingdom forts in a loose ring / spread
+      const placed = [];
+      let tries = 0;
+      for (let k=1;k<=R.king;k++){
+        let ok = false;
+        while(!ok && tries < 50000){
+          tries++;
+          // keep away from edges slightly
+          const x = 3 + (rand() * (W-6)) | 0;
+          const y = 3 + (rand() * (H-6)) | 0;
+
+          // min distance from existing
+          let good = true;
+          for (let i=0;i<placed.length;i++){
+            const p = placed[i];
+            const dx = p.x - x, dy = p.y - y;
+            if (dx*dx + dy*dy < 36) { good = false; break; } // ~6 tiles
+          }
+          if (!good) continue;
+
+          tiles[idx(x,y)] = T_KING;
+          kingdomIndex[idx(x,y)] = k;
+          placed.push({x,y});
+          ok = true;
+        }
+      }
+
+      // place other types by probability, avoiding kingdom tiles
+      for (let y=0;y<H;y++){
+        for (let x=0;x<W;x++){
+          const i = idx(x,y);
+          if (tiles[i] === T_KING) continue;
+          const r = rand();
+          if (r < R.barb) tiles[i] = T_BARB;
+          else if (r < R.barb + R.mine) tiles[i] = T_MINE;
+          else if (r < R.barb + R.mine + R.forest) tiles[i] = T_FOREST;
+          else if (r < R.barb + R.mine + R.forest + R.farm) tiles[i] = T_FARM;
+          else tiles[i] = T_EMPTY;
+        }
+      }
+    }
+
+    function getType(x,y){
+      if (x<0||y<0||x>=W||y>=H) return T_EMPTY;
+      return tiles ? tiles[idx(x,y)] : T_EMPTY;
+    }
+
+    function getKingdomNumber(x,y){
+      if (!kingdomIndex) return 0;
+      if (x<0||y<0||x>=W||y>=H) return 0;
+      return kingdomIndex[idx(x,y)]|0;
+    }
+
+    function typeLabel(t, kNum){
+      if (t===T_FARM) return I18N.t('tile_farm');
+      if (t===T_FOREST) return I18N.t('tile_forest');
+      if (t===T_MINE) return I18N.t('tile_mine');
+      if (t===T_BARB) return I18N.t('tile_barbar');
+      if (t===T_KING) return I18N.t('tile_kingdom') + (kNum?(' #' + kNum):'');
+      return I18N.t('tile_empty');
+    }
+
+    return { W,H, T_EMPTY,T_FARM,T_FOREST,T_MINE,T_BARB,T_KING, regen, getType, getKingdomNumber, typeLabel };
+  })();
+
+  // ---------- Map camera & interaction ----------
+  const MapView = (() => {
+    // base tile size in world units (screen px at zoom=1)
+    const baseTileW = 60; // diamond width
+    const baseTileH = 30; // diamond height
+
+    // world->screen origin (map center at 0,0)
+    function tileToWorld(x,y){
+      // isometric transform
+      const wx = (x - y) * (baseTileW/2);
+      const wy = (x + y) * (baseTileH/2);
+      return { x: wx, y: wy };
+    }
+
+    function worldToScreen(wx,wy){
+      // camera pan in screen space:
+      const z = state.map.zoom;
+      const sx = (vw/2) + (wx * z) + state.map.camX;
+      const sy = (vh/2) + (wy * z) + state.map.camY;
+      return { x:sx, y:sy };
+    }
+
+    function screenToWorld(sx,sy){
+      const z = state.map.zoom;
+      const wx = (sx - (vw/2) - state.map.camX) / z;
+      const wy = (sy - (vh/2) - state.map.camY) / z;
+      return { x:wx, y:wy };
+    }
+
+    function worldToTile(wx,wy){
+      // inverse of iso:
+      // wx = (x-y)*tw/2
+      // wy = (x+y)*th/2
+      // => x = (wx/(tw/2) + wy/(th/2)) / 2
+      // => y = (wy/(th/2) - wx/(tw/2)) / 2
+      const a = wx / (baseTileW/2);
+      const b = wy / (baseTileH/2);
+      const tx = (a + b) / 2;
+      const ty = (b - a) / 2;
+      return { x: tx, y: ty };
+    }
+
+    function screenToTile(sx,sy){
+      const w = screenToWorld(sx,sy);
+      return worldToTile(w.x, w.y);
+    }
+
+    function clampCamera(){
+      // clamp camera so map stays roughly in view
+      const z = state.map.zoom;
+      // map bounds in world
+      const p00 = tileToWorld(0,0);
+      const pW0 = tileToWorld(Map.W-1,0);
+      const p0H = tileToWorld(0,Map.H-1);
+      const pWH = tileToWorld(Map.W-1,Map.H-1);
+
+      const minWx = Math.min(p00.x, pW0.x, p0H.x, pWH.x);
+      const maxWx = Math.max(p00.x, pW0.x, p0H.x, pWH.x);
+      const minWy = Math.min(p00.y, pW0.y, p0H.y, pWH.y);
+      const maxWy = Math.max(p00.y, pW0.y, p0H.y, pWH.y);
+
+      // convert to screen extents at center
+      const pad = 140;
+      const left = (vw/2) + (minWx*z) + state.map.camX;
+      const right = (vw/2) + (maxWx*z) + state.map.camX;
+      const top = (vh/2) + (minWy*z) + state.map.camY;
+      const bottom = (vh/2) + (maxWy*z) + state.map.camY;
+
+      let dx=0, dy=0;
+      if (right < pad) dx = pad - right;
+      if (left > vw - pad) dx = (vw - pad) - left;
+      if (bottom < pad) dy = pad - bottom;
+      if (top > vh - pad) dy = (vh - pad) - top;
+
+      state.map.camX += dx;
+      state.map.camY += dy;
+    }
+
+    // smooth snap
+    let snapActive = false;
+    let snapTargetX = 0;
+    let snapTargetY = 0;
+
+    function requestSnapToTile(x,y){
+      const w = tileToWorld(x,y);
+      const s = worldToScreen(w.x,w.y);
+      // want tile center at screen center:
+      snapTargetX = state.map.camX + ((vw/2) - s.x);
+      snapTargetY = state.map.camY + ((vh/2) - s.y);
+      snapActive = true;
+    }
+
+    function updateSnap(dt){
+      if (!snapActive) return;
+      const t = clamp(dt/180, 0, 1);
+      const k = 1 - Math.pow(1 - t, 3);
+      const dx = snapTargetX - state.map.camX;
+      const dy = snapTargetY - state.map.camY;
+      if (dx*dx + dy*dy < 0.25) { state.map.camX = snapTargetX; state.map.camY = snapTargetY; snapActive = false; return; }
+      state.map.camX += dx * k;
+      state.map.camY += dy * k;
+    }
+
+    // visible tile range (rough)
+    function computeVisibleRange(){
+      const z = state.map.zoom;
+      const margin = 2;
+
+      // sample screen corners -> tile coords
+      const corners = [
+        screenToTile(0,0),
+        screenToTile(vw,0),
+        screenToTile(0,vh),
+        screenToTile(vw,vh)
+      ];
+
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (let i=0;i<corners.length;i++){
+        const c = corners[i];
+        minX = Math.min(minX, c.x);
+        maxX = Math.max(maxX, c.x);
+        minY = Math.min(minY, c.y);
+        maxY = Math.max(maxY, c.y);
+      }
+
+      // clamp to map
+      const ix0 = clamp((Math.floor(minX)-margin)|0, 0, Map.W-1);
+      const ix1 = clamp((Math.ceil(maxX)+margin)|0, 0, Map.W-1);
+      const iy0 = clamp((Math.floor(minY)-margin)|0, 0, Map.H-1);
+      const iy1 = clamp((Math.ceil(maxY)+margin)|0, 0, Map.H-1);
+      return { x0:ix0, x1:ix1, y0:iy0, y1:iy1 };
+    }
+
+    function drawDiamond(cx,cy,w,h,fill,stroke,alpha=1){
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - h/2);
+      ctx.lineTo(cx + w/2, cy);
+      ctx.lineTo(cx, cy + h/2);
+      ctx.lineTo(cx - w/2, cy);
+      ctx.closePath();
+      if (fill){
+        ctx.fillStyle = fill;
+        ctx.fill();
+      }
+      if (stroke){
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawMap(dt){
+      updateSnap(dt);
+
+      const z = state.map.zoom;
+      const tw = baseTileW * z;
+      const th = baseTileH * z;
+
+      // ground fade
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 84, vw, vh-84);
+      ctx.restore();
+
+      const vr = computeVisibleRange();
+
+      // draw tiles in painter order: y then x (for iso)
+      for (let y=vr.y0; y<=vr.y1; y++){
+        for (let x=vr.x0; x<=vr.x1; x++){
+          const w = tileToWorld(x,y);
+          const s = worldToScreen(w.x,w.y);
+          // quick cull
+          if (s.x < -tw || s.x > vw + tw || s.y < -th || s.y > vh + th) continue;
+
+          const t = Map.getType(x,y);
+          let fill = 'rgba(255,255,255,0.04)';
+          let edge = 'rgba(255,255,255,0.08)';
+
+          if (t === Map.T_FARM) fill = 'rgba(90,200,120,0.16)';
+          else if (t === Map.T_FOREST) fill = 'rgba(40,170,120,0.18)';
+          else if (t === Map.T_MINE) fill = 'rgba(140,160,210,0.16)';
+          else if (t === Map.T_BARB) fill = 'rgba(220,120,90,0.18)';
+          else if (t === Map.T_KING) fill = 'rgba(230,200,120,0.18)';
+
+          // soft shadow under tile
+          ctx.save();
+          ctx.globalAlpha = 0.22;
+          ctx.fillStyle = '#000';
+          ctx.beginPath();
+          ctx.ellipse(s.x, s.y + th*0.18, tw*0.33, th*0.22, 0, 0, Math.PI*2);
+          ctx.fill();
+          ctx.restore();
+
+          drawDiamond(s.x, s.y, tw, th, fill, edge, 1);
+
+          // icon-like center marker
+          if (t !== Map.T_EMPTY) {
+            ctx.save();
+            ctx.globalAlpha = 0.9;
+            ctx.fillStyle = 'rgba(255,255,255,0.25)';
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, Math.max(2, 3.5*z), 0, Math.PI*2);
+            ctx.fill();
+
+            // small inner dot tinted
+            let dot = 'rgba(255,255,255,0.65)';
+            if (t === Map.T_FARM) dot = 'rgba(160,255,190,0.9)';
+            else if (t === Map.T_FOREST) dot = 'rgba(120,240,190,0.9)';
+            else if (t === Map.T_MINE) dot = 'rgba(190,210,255,0.9)';
+            else if (t === Map.T_BARB) dot = 'rgba(255,170,150,0.9)';
+            else if (t === Map.T_KING) dot = 'rgba(255,235,170,0.95)';
+            ctx.fillStyle = dot;
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, Math.max(1.5, 2.4*z), 0, Math.PI*2);
+            ctx.fill();
+            ctx.restore();
+          }
+
+          // kingdom number
+          if (t === Map.T_KING) {
+            const kNum = Map.getKingdomNumber(x,y);
+            ctx.save();
+            ctx.globalAlpha = 0.9;
+            ctx.fillStyle = 'rgba(0,0,0,0.35)';
+            ctx.beginPath();
+            ctx.ellipse(s.x, s.y- th*0.06, tw*0.12, th*0.14, 0, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = 'rgba(255,255,255,0.92)';
+            ctx.font = `800 ${Math.max(10, 12*z)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(kNum||''), s.x, s.y- th*0.06);
+            ctx.restore();
+          }
+        }
+      }
+
+      // selection highlight
+      const sx = state.map.selX|0, sy = state.map.selY|0;
+      if (sx>=0 && sy>=0 && sx<Map.W && sy<Map.H) {
+        const w = tileToWorld(sx,sy);
+        const s = worldToScreen(w.x,w.y);
+
+        const pulse = 0.5 + 0.5*Math.sin(performance.now()/220);
+        const a = 0.25 + 0.20*pulse;
+
+        drawDiamond(s.x, s.y, tw*1.06, th*1.06, `rgba(90,140,255,${a.toFixed(3)})`, 'rgba(180,210,255,0.55)', 1);
+      }
+    }
+
+    function selectFromScreen(sx,sy){
+      const t = screenToTile(sx,sy);
+      const x = Math.floor(t.x + 0.5);
+      const y = Math.floor(t.y + 0.5);
+      if (x<0||y<0||x>=Map.W||y>=Map.H) return false;
+      state.map.selX = x;
+      state.map.selY = y;
+      const tt = Map.getType(x,y);
+      if (tt === Map.T_KING) {
+        state.world.selectedKingdomId = Math.max(1, Map.getKingdomNumber(x,y)|0);
+      }
+      requestSnapToTile(x,y);
+      requestSave();
+      return true;
+    }
+
+    function zoomAt(screenX, screenY, factor){
+      const oldZ = state.map.zoom;
+      const newZ = clamp(oldZ * factor, 0.6, 2.4);
+      if (Math.abs(newZ - oldZ) < 0.0001) return;
+
+      // keep world point under cursor stable
+      const before = screenToWorld(screenX, screenY);
+      state.map.zoom = newZ;
+      const after = screenToWorld(screenX, screenY);
+
+      const dxW = after.x - before.x;
+      const dyW = after.y - before.y;
+
+      // convert world delta to screen delta at new zoom
+      state.map.camX += dxW * newZ;
+      state.map.camY += dyW * newZ;
+
+      clampCamera();
+      requestSave();
+    }
+
+    return { baseTileW, baseTileH, tileToWorld, worldToScreen, screenToTile, drawMap, selectFromScreen, clampCamera, zoomAt };
+  })();
+
+
+  // ---------- City view ----------
+  const CityView = (() => {
+    const GRID_W = 24, GRID_H = 24;
+    const tileW = 72, tileH = 36;
+
+    function tileToWorld(x,y){ return { x:(x-y)*(tileW/2), y:(x+y)*(tileH/2) }; }
+    function worldToScreen(wx,wy){ return { x: (vw/2) + wx + state.city.camX, y: (vh/2) + wy + state.city.camY }; }
+    function screenToWorld(sx,sy){ return { x:sx-(vw/2)-state.city.camX, y:sy-(vh/2)-state.city.camY }; }
+    function screenToTile(sx,sy){
+      const w = screenToWorld(sx,sy);
+      const a = w.x/(tileW/2), b = w.y/(tileH/2);
+      return { x:(a+b)/2, y:(b-a)/2 };
+    }
+    function snapTile(sx,sy){
+      const t = screenToTile(sx,sy);
+      return { x: clamp(Math.floor(t.x+0.5),0,GRID_W-1), y: clamp(Math.floor(t.y+0.5),0,GRID_H-1) };
+    }
+    function canPlaceAt(tx,ty){
+      if (tx<0 || ty<0 || tx+1>=GRID_W || ty+1>=GRID_H) return false;
+      for (let i=0;i<state.city.buildings.length;i++){
+        const b = state.city.buildings[i];
+        if (!(tx+1 < b.x || tx > b.x+1 || ty+1 < b.y || ty > b.y+1)) return false;
+      }
+      return true;
+    }
+    function updateGhostFromScreen(sx,sy){
+      if (!state.city.ghostActive) return;
+      const t = snapTile(sx,sy);
+      state.city.ghostX = clamp(t.x,0,GRID_W-2);
+      state.city.ghostY = clamp(t.y,0,GRID_H-2);
+    }
+    function placeGhost(){
+      if (!state.city.ghostActive) return false;
+      const x = state.city.ghostX|0, y = state.city.ghostY|0;
+      if (!canPlaceAt(x,y)) return false;
+      state.city.buildings.push({x,y,w:2,h:2});
+      state.city.ghostActive = false;
+      requestSave();
+      return true;
+    }
+    function drawDiamond(cx,cy,w,h,fill,stroke){
+      ctx.beginPath(); ctx.moveTo(cx,cy-h/2); ctx.lineTo(cx+w/2,cy); ctx.lineTo(cx,cy+h/2); ctx.lineTo(cx-w/2,cy); ctx.closePath();
+      if (fill){ ctx.fillStyle=fill; ctx.fill(); }
+      if (stroke){ ctx.strokeStyle=stroke; ctx.lineWidth=1; ctx.stroke(); }
+    }
+    function draw(){
+      for (let y=0;y<GRID_H;y++){
+        for (let x=0;x<GRID_W;x++){
+          const w = tileToWorld(x,y); const s = worldToScreen(w.x,w.y);
+          if (s.x < -tileW || s.x > vw + tileW || s.y < 60 || s.y > vh + tileH) continue;
+          const shade = ((x+y)&1) ? 'rgba(110,150,190,0.15)' : 'rgba(80,120,170,0.14)';
+          drawDiamond(s.x,s.y,tileW,tileH,shade,'rgba(210,230,255,0.12)');
+        }
+      }
+      for (let i=0;i<state.city.buildings.length;i++){
+        const b=state.city.buildings[i];
+        const p=tileToWorld(b.x+0.5,b.y+0.5); const s=worldToScreen(p.x,p.y);
+        const bw=tileW*1.55,bh=tileH*1.20;
+        ctx.fillStyle='rgba(65,105,170,0.88)'; roundRect(s.x-bw/2,s.y-bh+4,bw,bh,10); ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,0.20)'; roundRect(s.x-bw/2+3,s.y-bh+8,bw-6,12,6); ctx.fill();
+      }
+      if (state.city.ghostActive){
+        const x=state.city.ghostX|0, y=state.city.ghostY|0;
+        const p=tileToWorld(x+0.5,y+0.5); const s=worldToScreen(p.x,p.y);
+        const ok = canPlaceAt(x,y);
+        const bw=tileW*1.55,bh=tileH*1.20;
+        ctx.fillStyle = ok ? 'rgba(80,220,140,0.42)' : 'rgba(255,80,80,0.42)';
+        roundRect(s.x-bw/2,s.y-bh+4,bw,bh,10); ctx.fill();
+      }
+    }
+    return { draw, updateGhostFromScreen, placeGhost };
+  })();
+
+  // ---------- Input (map/city-aware) ----------
+  const Input = (() => {
+    let down = false;
+    let moved = false;
+    let downX=0, downY=0;
+    let lastX=0, lastY=0;
+    let downOnUI = false;
+
+    let pinch = false;
+    let pinchDist0 = 0;
+    let pinchMidX = 0;
+    let pinchMidY = 0;
+
+    const TAP_SLOP = 12;
+    const DRAG_SLOP2 = TAP_SLOP*TAP_SLOP;
+
+    function getTouch(ev, i){
+      const t = ev.touches && ev.touches[i];
+      return t ? { x:t.clientX, y:t.clientY } : null;
+    }
+
+    function onTouchStart(ev){
+      ev.preventDefault();
+
+      if (ev.touches && ev.touches.length === 2) {
+        // start pinch
+        const a = getTouch(ev,0), b = getTouch(ev,1);
+        if (!a || !b) return;
+        pinch = true;
+        down = false;
+        moved = true;
+
+        const dx = b.x - a.x, dy = b.y - a.y;
+        pinchDist0 = Math.sqrt(dx*dx + dy*dy);
+        pinchMidX = (a.x + b.x)/2;
+        pinchMidY = (a.y + b.y)/2;
+
+        Buttons.cancel();
+        return;
+      }
+
+      // single touch start
+      const p = getTouch(ev,0) || { x: ev.clientX, y: ev.clientY };
+      down = true;
+      moved = false;
+      downX = lastX = p.x;
+      downY = lastY = p.y;
+
+      downOnUI = Buttons.onDown(p.x,p.y);
+    }
+
+    function onTouchMove(ev){
+      if (pinch) {
+        ev.preventDefault();
+        if (!ev.touches || ev.touches.length !== 2) return;
+        const a = getTouch(ev,0), b = getTouch(ev,1);
+        if (!a || !b) return;
+
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        const midX = (a.x + b.x)/2;
+        const midY = (a.y + b.y)/2;
+
+        const factor = d / Math.max(1, pinchDist0);
+        pinchDist0 = d;
+        pinchMidX = midX;
+        pinchMidY = midY;
+
+        if (state.screen === 'map') MapView.zoomAt(midX, midY, factor);
+
+        return;
+      }
+
+      if (!down) return;
+      ev.preventDefault();
+      const p = getTouch(ev,0) || { x: ev.clientX, y: ev.clientY };
+
+      const dx = p.x - downX, dy = p.y - downY;
+      if (!moved && (dx*dx + dy*dy) > DRAG_SLOP2) moved = true;
+
+      if (moved && !downOnUI) {
+        if (state.screen === 'map') {
+          state.map.camX += (p.x - lastX);
+          state.map.camY += (p.y - lastY);
+          MapView.clampCamera();
+        } else if (state.screen === 'city') {
+          state.city.camX += (p.x - lastX);
+          state.city.camY += (p.y - lastY);
+          if (state.city.ghostActive) CityView.updateGhostFromScreen(p.x,p.y);
+        }
+      } else if (!moved && state.screen === 'city' && state.city.ghostActive && !downOnUI) {
+        CityView.updateGhostFromScreen(p.x,p.y);
+      }
+
+      lastX = p.x; lastY = p.y;
+    }
+
+    function onTouchEnd(ev){
+      ev.preventDefault();
+
+      if (pinch) {
+        // end pinch when <2 touches
+        if (!ev.touches || ev.touches.length < 2) pinch = false;
+        return;
+      }
+
+      if (!down) return;
+      const p = (ev.changedTouches && ev.changedTouches[0]) ? { x: ev.changedTouches[0].clientX, y: ev.changedTouches[0].clientY } : { x:lastX, y:lastY };
+
+      down = false;
+
+      if (!moved) {
+        // tap
+        const fired = Buttons.onUp(p.x,p.y);
+        if (!fired) {
+          if (state.screen === 'map') {
+            const ok = MapView.selectFromScreen(p.x,p.y);
+            if (ok && state.settings.haptics) HapticsBridge.vibrate(15);
+          } else if (state.screen === 'city') {
+            if (state.city.ghostActive) {
+              CityView.updateGhostFromScreen(p.x,p.y);
+              const placed = CityView.placeGhost();
+              if (placed) toast(I18N.t('place'), 0.8);
+            }
+          }
+        } else {
+          if (state.settings.haptics) HapticsBridge.vibrate(12);
+        }
+      } else {
+        Buttons.onUp(-9999,-9999);
+      }
+
+      requestSave();
+    }
+
+    function onWheel(ev){
+      // desktop zoom
+      if (state.screen !== 'map') return;
+      ev.preventDefault();
+      const factor = ev.deltaY < 0 ? 1.07 : 0.935;
+      MapView.zoomAt(ev.clientX, ev.clientY, factor);
+    }
+
+    function bind() {
+      const opts = { passive:false };
+      canvas.addEventListener('touchstart', onTouchStart, opts);
+      canvas.addEventListener('touchmove', onTouchMove, opts);
+      canvas.addEventListener('touchend', onTouchEnd, opts);
+      canvas.addEventListener('touchcancel', onTouchEnd, opts);
+
+      canvas.addEventListener('mousedown', (ev)=>onTouchStart(ev), opts);
+      window.addEventListener('mousemove', (ev)=>onTouchMove(ev), opts);
+      window.addEventListener('mouseup', (ev)=>onTouchEnd(ev), opts);
+
+      canvas.addEventListener('wheel', onWheel, opts);
+    }
+
+    return { bind };
+  })();
+
+  // ---------- UI Layout ----------
+  function topInset(){ return 0; }
+
+  function layoutButtons() {
+    Buttons.clear();
+
+    const pad = 12;
+    const inset = topInset();
+    const barH = 64;
+    const chipH = 48;
+    const gap = 10;
+
+    // Left chip group (City/Map)
+    const w1 = 128, w2 = 128;
+    const x0 = pad;
+    const y0 = inset + (barH-chipH)/2;
+
+    Buttons.add({
+      id:'chip_city',
+      x:x0, y:y0, w:w1, h:chipH, r:16,
+      label:I18N.t('city'),
+      kind: state.screen==='city' ? 'primary' : 'secondary',
+      font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+      onClick: () => { state.screen='city'; state.ui.settingsOpen = false; state.ui.confirmReset=false; requestSave(); }
+    });
+
+    Buttons.add({
+      id:'chip_map',
+      x:x0 + w1 + gap, y:y0, w:w2, h:chipH, r:16,
+      label:I18N.t('map'),
+      kind: state.screen==='map' ? 'primary' : 'secondary',
+      font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+      onClick: () => { state.screen='map'; state.ui.settingsOpen = false; state.ui.confirmReset=false; requestSave(); }
+    });
+
+    // City action
+    if (state.screen === 'city') {
+      Buttons.add({
+        id:'btn_place', x: x0 + w1 + w2 + gap*2, y:y0, w:132, h:chipH, r:16,
+        label:I18N.t('place'),
+        kind: state.city.ghostActive ? 'primary' : 'secondary',
+        font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+        onClick: () => { state.city.ghostActive = !state.city.ghostActive; requestSave(); }
+      });
+    }
+
+    // Right buttons (Debug + Settings)
+    const icon = 48;
+    const yR = y0;
+    const xSettings = vw - pad - icon;
+    const xDebug = xSettings - gap - icon;
+
+    Buttons.add({
+      id:'btn_debug',
+      x:xDebug, y:yR, w:icon, h:chipH, r:16,
+      label:'⋯',
+      kind: state.ui.debug ? 'primary' : 'secondary',
+      font:'800 18px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+      onClick: () => {
+        state.ui.debug = !state.ui.debug;
+        toast(state.ui.debug ? I18N.t('debug_on') : I18N.t('debug_off'), 1.0);
+        requestSave();
+      }
+    });
+
+    Buttons.add({
+      id:'btn_settings',
+      x:xSettings, y:yR, w:icon, h:chipH, r:16,
+      label:'⚙',
+      kind:'secondary',
+      font:'800 18px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+      onClick: () => {
+        state.ui.settingsOpen = !state.ui.settingsOpen;
+        state.ui.confirmReset = false;
+        requestSave();
+      }
+    });
+
+    // Settings panel buttons (if open)
+    if (state.ui.settingsOpen) {
+      const panelW = Math.min(420, vw - pad*2);
+      const panelX = (vw - panelW)/2;
+      const panelY = inset + barH + 10;
+      const rowH = 54;
+
+      const makeToggle = (id, label, y, getter, setter) => {
+        Buttons.add({
+          id, x: panelX+16, y, w: panelW-32, h: rowH, r: 14,
+          label: label + ': ' + (getter() ? 'ON' : 'OFF'),
+          kind:'secondary',
+          font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+          onClick: () => { setter(!getter()); requestSave(); }
+        });
+      };
+
+      let y = panelY + 64;
+      makeToggle('t_sound', I18N.t('sound'), y, () => state.settings.sound, v => state.settings.sound = v); y += rowH + 10;
+      makeToggle('t_music', I18N.t('music'), y, () => state.settings.music, v => state.settings.music = v); y += rowH + 10;
+      makeToggle('t_hapt', I18N.t('haptics'), y, () => state.settings.haptics, v => state.settings.haptics = v); y += rowH + 10;
+
+      Buttons.add({
+        id:'lang',
+        x: panelX+16, y, w: panelW-32, h: rowH, r: 14,
+        label: I18N.t('language') + ': ' + (state.lang==='tr'?'TR':'EN'),
+        kind:'secondary',
+        font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+        onClick: () => {
+          state.lang = (state.lang==='tr') ? 'en' : 'tr';
+          I18N.set(state.lang);
+          requestSave();
+        }
+      });
+      y += rowH + 14;
+
+      Buttons.add({
+        id:'reset',
+        x: panelX+16, y, w: panelW-32, h: rowH, r: 14,
+        label: state.ui.confirmReset ? I18N.t('reset_confirm') : I18N.t('reset'),
+        kind: state.ui.confirmReset ? 'primary' : 'secondary',
+        font:'700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial',
+        onClick: () => {
+          if (!state.ui.confirmReset) {
+            state.ui.confirmReset = true;
+            toast(I18N.t('reset_confirm'), 1.2);
+          } else {
+            hardReset();
+            state.ui.settingsOpen = false;
+            state.ui.confirmReset = false;
+          }
+          requestSave();
+        }
+      });
+    }
+  }
+
+  // ---------- UI Draw ----------
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0,0,0,vh);
+    g.addColorStop(0, '#050816');
+    g.addColorStop(1, '#09142a');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,vw,vh);
+
+    // subtle vignette
+    ctx.globalAlpha = 0.22;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,vw,40);
+    ctx.fillRect(0,vh-60,vw,60);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTopBar() {
+    const inset = topInset();
+    const pad = 12;
+    const barH = 64;
+
+    ctx.save();
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    roundRect(pad, inset+8, vw-pad*2, barH, 18);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    roundRect(pad, inset+8, vw-pad*2, barH, 18);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawLegend() {
+    if (state.screen !== 'map') return;
+    const pad = 12;
+    const inset = topInset();
+    const x = pad;
+    const y = inset + 78;
+    const w = 220;
+    const h = 174;
+
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = '#000';
+    roundRect(x, y+4, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = 'rgba(12,18,34,1)';
+    roundRect(x, y, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '800 14px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(I18N.t('legend'), x+12, y+10);
+
+    const rows = [
+      { c:'rgba(90,200,120,0.35)', t:I18N.t('tile_farm') },
+      { c:'rgba(40,170,120,0.38)', t:I18N.t('tile_forest') },
+      { c:'rgba(140,160,210,0.35)', t:I18N.t('tile_mine') },
+      { c:'rgba(220,120,90,0.38)', t:I18N.t('tile_barbar') },
+      { c:'rgba(230,200,120,0.38)', t:I18N.t('tile_kingdom') },
+    ];
+
+    ctx.font = '700 12px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    let ry = y + 38;
+    for (let i=0;i<rows.length;i++){
+      const r = rows[i];
+      ctx.fillStyle = r.c;
+      roundRect(x+12, ry+2, 18, 12, 4);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.84)';
+      ctx.fillText(r.t, x+38, ry);
+      ry += 26;
+    }
+
+    ctx.restore();
+  }
+
+  function drawInfoCard() {
+    if (state.screen !== 'map') return;
+
+    const pad = 12;
+    const w = Math.min(560, vw - pad*2);
+    const h = 102;
+    const x = (vw - w)/2;
+    const y = vh - h - 14;
+
+    const tx = state.map.selX|0;
+    const ty = state.map.selY|0;
+    const type = Map.getType(tx,ty);
+    const kNum = Map.getKingdomNumber(tx,ty);
+
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = '#000';
+    roundRect(x, y+5, w, h, 16);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = 'rgba(12,18,34,1)';
+    roundRect(x, y, w, h, 16);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '800 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(Map.typeLabel(type, kNum), x+14, y+12);
+
+    ctx.globalAlpha = 0.88;
+    ctx.font = '700 12px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(I18N.t('coord') + ': ' + tx + ', ' + ty, x+14, y+38);
+    const regionName = GameData.regionName(state.world.currentRegionId, state.lang);
+    ctx.fillText(I18N.t('region') + ': ' + regionName, x+14, y+56);
+    if (type === Map.T_KING) {
+      const k = Math.max(1, Map.getKingdomNumber(tx,ty)|0);
+      const kd = GameData.regions[state.world.currentRegionId-1].kingdoms[k-1];
+      ctx.fillText(I18N.t('kingdom') + ': #' + k + '  ' + I18N.t('req_power') + ': ' + kd.requiredPower, x+w*0.42, y+56);
+    }
+
+    ctx.globalAlpha = 0.65;
+    ctx.font = '600 12px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'right';
+    ctx.fillText(I18N.t('hint_tap'), x+w-14, y+38);
+
+    ctx.restore();
+  }
+
+  function drawSettingsPanel() {
+    if (!state.ui.settingsOpen) return;
+
+    const pad = 12;
+    const inset = topInset();
+    const barH = 64;
+
+    const panelW = Math.min(420, vw - pad*2);
+    const x = (vw - panelW)/2;
+    const y = inset + barH + 10;
+    const h = 360;
+
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = '#000';
+    roundRect(x, y+6, panelW, h, 18);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    const g = ctx.createLinearGradient(0, y, 0, y+h);
+    g.addColorStop(0, 'rgba(255,255,255,0.10)');
+    g.addColorStop(1, 'rgba(0,0,0,0.25)');
+    ctx.fillStyle = g;
+    roundRect(x, y, panelW, h, 18);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '800 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(I18N.t('settings'), x+16, y+14);
+
+    ctx.restore();
+  }
+
+  function drawToast() {
+    const now = performance.now();
+    if (!toastState.text || now > toastState.until) return;
+
+    const pad = 12;
+    const w = Math.min(vw - pad*2, 520);
+    const h = 44;
+    const x = (vw - w)/2;
+    const y = vh - h - 18;
+
+    ctx.save();
+    ctx.globalAlpha = 0.65;
+    ctx.fillStyle = '#000';
+    roundRect(x, y+4, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = 'rgba(18,24,40,1)';
+    roundRect(x, y, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '700 14px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(toastState.text, x+w/2, y+h/2);
+
+    ctx.restore();
+  }
+
+  function drawDebug() {
+    if (!state.ui.debug) return;
+
+    const pad = 12;
+    const inset = topInset();
+    const w = Math.min(560, vw - pad*2);
+    const h = 192;
+    const x = pad;
+    const y = inset + 78;
+
+    const now = performance.now();
+    const errAge = diag.lastErr ? ((now - diag.lastErrAt)/1000).toFixed(1) : '-';
+    const saveAge = diag.lastSaveAt ? ((now - diag.lastSaveAt)/1000).toFixed(1) : '-';
+
+    ctx.save();
+    ctx.globalAlpha = 0.65;
+    ctx.fillStyle = '#000';
+    roundRect(x, y+4, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = 'rgba(12,18,34,1)';
+    roundRect(x, y, w, h, 14);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    let ty = y + 10;
+    const line = 16;
+    ctx.fillText('fps: ' + (diag.fps|0) + '  frame(ms): ' + diag.frameMs.toFixed(1), x+12, ty); ty += line;
+    ctx.fillText('vw×vh: ' + vw + '×' + vh + '  dpr: ' + dpr.toFixed(2), x+12, ty); ty += line;
+    ctx.fillText('storage: ' + (StorageSafe.hasLS() ? 'ok' : 'mem') + '  key: ' + StorageSafe.KEY, x+12, ty); ty += line;
+    ctx.fillText('screen: ' + state.screen + '  zoom: ' + state.map.zoom.toFixed(2), x+12, ty); ty += line;
+    ctx.fillText('cam: ' + state.map.camX.toFixed(1) + ', ' + state.map.camY.toFixed(1) + '  sel: ' + state.map.selX + ',' + state.map.selY, x+12, ty); ty += line;
+    ctx.fillText('region: ' + state.world.currentRegionId + '  kingdom: ' + state.world.selectedKingdomId, x+12, ty); ty += line;
+    ctx.fillText('res: F' + state.resources.food + ' W' + state.resources.wood + ' I' + state.resources.iron, x+12, ty); ty += line;
+
+    if (diag.lastErr) {
+      ctx.fillStyle = 'rgba(255,180,180,0.92)';
+      ctx.fillText('lastErrAge(s): ' + errAge, x+12, ty); ty += line;
+      ctx.fillText('lastErr: ' + diag.lastErr, x+12, ty);
+    } else {
+      ctx.fillStyle = 'rgba(180,255,200,0.92)';
+      ctx.fillText('lastErr: -', x+12, ty);
+    }
+
+    ctx.restore();
+  }
+
+  // ---------- Main loop ----------
+  let last = 0;
+  function frame(ts) {
+    const dt = last ? (ts - last) : 16;
+    last = ts;
+
+    diag.frameMs = dt;
+    const inst = dt > 0 ? (1000/dt) : 0;
+    diag.fps = diag.fps ? (diag.fps*0.9 + inst*0.1) : inst;
+
+    if (canvas.width < 2 || canvas.height < 2) resize();
+
+    drawBackground();
+    drawTopBar();
+
+    // content
+    if (state.screen === 'map') {
+      MapView.drawMap(dt);
+      if (!state.ui.debug) drawLegend(); // keep debug readable
+      drawInfoCard();
+    } else {
+      CityView.draw();
+    }
+
+    // UI
+    layoutButtons();
+    drawSettingsPanel();
+    Buttons.draw();
+    drawDebug();
+    drawToast();
+
+    flushSave();
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- Boot ----------
+  function boot() {
+    try {
+      resize();
+      loadState();
+      I18N.set(state.lang);
+
+      // map init
+      Map.regen(state.map.seed|0);
+      if (Map.getType(state.map.selX|0, state.map.selY|0) === Map.T_KING) {
+        state.world.selectedKingdomId = Math.max(1, Map.getKingdomNumber(state.map.selX|0, state.map.selY|0)|0);
+      }
+      // initial camera: center-ish
+      if (!Number.isFinite(state.map.camX)) state.map.camX = 0;
+      if (!Number.isFinite(state.map.camY)) state.map.camY = -120;
+
+      toast(StorageSafe.hasLS() ? I18N.t('storage_ok') : I18N.t('storage_mem'), 1.0);
+
+      Input.bind();
+
+      // immediate first draw
+      drawBackground();
+      drawTopBar();
+      if (state.screen === 'map') MapView.drawMap(16); else CityView.draw();
+      layoutButtons();
+      Buttons.draw();
+      drawToast();
+
+      requestAnimationFrame(frame);
+    } catch (e) {
+      try {
+        resize();
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+        ctx.fillStyle = '#0b1020';
+        ctx.fillRect(0,0,vw,vh);
+        ctx.fillStyle = '#fff';
+        ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('BOOT ERROR (see Console)', vw/2, vh/2);
+        diag.lastErr = String(e && e.message ? e.message : e);
+        diag.lastErrAt = performance.now();
+      } catch (_) {}
+      console.error(e);
+    }
+  }
+
+  function forceRedraw() {
+    drawBackground();
+    drawTopBar();
+    if (state.screen === 'map') MapView.drawMap(16); else CityView.draw();
+    layoutButtons();
+    drawSettingsPanel();
+    Buttons.draw();
+    drawDebug();
+    drawToast();
+  }
+
+  function retryRender() {
+    resize();
+    forceRedraw();
+    requestSave();
+  }
+
+  function installWatchdog() {
+    const start = performance.now();
+    let checks = 0;
+    function tick() {
+      const now = performance.now();
+      if (now - start > 2000) return;
+      checks++;
+      const badSize = canvas.width < 2 || canvas.height < 2 || vw < 2 || vh < 2;
+      const noFrame = !last;
+      if (badSize || (noFrame && checks > 20)) retryRender();
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  window.addEventListener('resize', retryRender, { passive:true });
+  window.addEventListener('pageshow', retryRender, { passive:true });
+  window.addEventListener('focus', retryRender, { passive:true });
+  window.addEventListener('orientationchange', retryRender, { passive:true });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) retryRender(); }, { passive:true });
+
+  window.addEventListener('load', () => { boot(); installWatchdog(); }, { once:true });
+  setTimeout(() => { if (!last) { boot(); installWatchdog(); } }, 300);
+
+})();
+</script>
+</body>
+</html>
